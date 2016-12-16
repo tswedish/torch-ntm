@@ -1,6 +1,12 @@
 require('torch')
+require('cutorch')
 require('nn')
+require('cunn')
+require('cudnn')
 require('nngraph')
+
+cudnn.fastest = true
+cudnn.benchmark = true
 
 ntm = {}
 printf = utils.printf
@@ -13,6 +19,7 @@ include('layers/Print.lua')
 include('layers/SmoothCosineSimilarity.lua')
 include('layers/ScalarMulTable.lua')
 include('layers/ScalarDivTable.lua')
+include('layers/MinNMask.lua')
 include('NTM.lua')
 
 function share_params(cell, src, ...)

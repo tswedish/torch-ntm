@@ -15,7 +15,18 @@ end
 
 function ScalarMulTable:updateOutput(input)
   local v, scale = unpack(input)
-  return self.output:set(v * scale[1])
+
+  self.output:resizeAs(v)
+  -- bmm
+  self.output = torch.bmm(
+    scale:view(-1,1,1),
+    v:view(-1,1,v:size(v:dim()))
+  ):squeeze()
+  --[[for i=1,scale:size(1) do
+    self.output[i] = scale[i] * v[i]
+  end]]
+
+  return self.output
 end
 
 function ScalarMulTable:updateGradInput(input, gradOutput)
@@ -24,7 +35,20 @@ function ScalarMulTable:updateGradInput(input, gradOutput)
   self.gradInput[2] = self.gradInput[2] or input[2].new()
   self.gradInput[2]:resizeAs(input[2])
 
-  self.gradInput[1]:set(gradOutput * scale[1])
-  self.gradInput[2][1] = gradOutput:dot(v)
+  -- recover vector
+  self.gradInput[1]:set(torch.bmm(
+      gradOutput:view(-1,v:size(v:dim()),1),
+      scale:view(-1,1,1)
+    ):squeeze()
+  )
+
+  -- recover scale
+  self.gradInput[2] = torch.bmm(
+      gradOutput:view(-1,1,v:size(v:dim())),
+      v:view(-1,v:size(v:dim()),1)
+  ):squeeze():view(-1,1)
+
+  --[[self.gradInput[1]:set(gradOutput * scale[1])
+  self.gradInput[2][1] = gradOutput:dot(v)]]
   return self.gradInput
 end

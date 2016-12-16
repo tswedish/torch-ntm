@@ -17,7 +17,14 @@ function OuterProd:updateOutput(input)
   local order = #input
   self.order = order
   if order == 2 then
-    self.output:set(torch.ger(input[1], input[2]))
+    if input[1]:size(2) and input[1]:size(2) > 1 then
+      self.output:set(torch.bmm(
+        input[1]:view(-1,input[1]:size(2),1),
+        input[2]:view(-1,1,input[2]:size(2)))
+      )
+    else
+      self.output:set(torch.ger(input[1], input[2]))
+    end    
     self.size = self.output:size()
   elseif order == 3 then
     -- allocate
@@ -47,8 +54,18 @@ function OuterProd:updateGradInput(input, gradOutput)
   end
 
   if order == 2 then
-    self.gradInput[1]:copy(gradOutput * input[2])
-    self.gradInput[2]:copy(gradOutput:t() * input[1])
+    -- 3xmxn * 3xnxk
+    self.gradInput[1]:copy(torch.bmm(
+      gradOutput,
+      input[2]:view(-1,input[2]:size(input[2]:dim()),1))
+      :squeeze()
+    )
+    self.gradInput[2]:copy(torch.bmm(
+      input[1]:view(-1,1,input[1]:size(input[1]:dim())),
+      gradOutput)
+      :squeeze()
+    )
+
   else
     local u, v, w = unpack(input)
     local du, dv, dw = u:size(1), v:size(1), w:size(1)

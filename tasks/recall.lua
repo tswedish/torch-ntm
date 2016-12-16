@@ -27,7 +27,8 @@ local config = {
   output_dim = 8,
   mem_rows = 128,
   mem_cols = 20,
-  cont_dim = 100
+  cont_dim = 100,
+  use_lrua = true
 }
 
 local input_dim = config.input_dim
@@ -87,7 +88,7 @@ function forward(model, items, num_queries, print_flag)
     query_indices[i] = query_idx
     local query = items[query_idx]
     local target = items[query_idx + 1]
-    
+
     -- query
     model:forward(query_symbol)
     if print_flag then
@@ -159,19 +160,10 @@ function backward(model, items, query_indices, outputs, criteria)
 end
 
 local model = ntm.NTM(config)
+--put on the gpu?
+--cuda() -- what about data?
 local params, grads = model:getParameters()
 local num_iters = 50000
-local min_len = 2
-local max_len = 6
-local item_len = 3
-print(string.rep('=', 80))
-print("NTM associative recall task")
-print('training up to ' .. num_iters .. ' iteration(s)')
-print('min sequence length = ' .. min_len)
-print('max sequence length = ' .. max_len)
-print('sequence element length = ' .. item_len)
-print(string.rep('=', 80))
-print('num params: ' .. params:size(1))
 
 local rmsprop_state = {
   learningRate = 1e-4,
@@ -179,42 +171,24 @@ local rmsprop_state = {
   decay = 0.95
 }
 
+local criteria = nn.BCECriterion()
+
 -- train
-local start = sys.clock()
-local print_interval = 25
 for iter = 1, num_iters do
-  local print_flag = (iter % print_interval == 0)
-  local num_items = math.floor(torch.uniform(min_len, max_len + 1))
-  local num_queries = math.floor(torch.uniform(1, num_items + 1))
-  local items = generate_items(num_items, item_len)
 
   local feval = function(x)
-    if print_flag then
-      print(string.rep('=', 80))
-      print('iter = ' .. iter)
-      print('learn rate = ' .. rmsprop_state.learningRate)
-      print('momentum = ' .. rmsprop_state.momentum)
-      print('decay = ' .. rmsprop_state.decay)
-      print('num items = ' .. num_items)
-      print('num queries = ' .. num_queries)
-      printf('t = %.1fs\n', sys.clock() - start)
-    end
 
     local loss = 0
     grads:zero()
 
-    local query_indices, outputs, criteria, sample_loss = forward(
-      model, items, num_queries, print_flag)
-    loss = loss + sample_loss
-    backward(model, items, query_indices, outputs, criteria)
+    local input, target = data:sample()
+
+    local outputs = model:forward(input)
+
+    loss = model:backward(outputs, targets)
 
     -- clip gradients
     grads:clamp(-10, 10)
-    if print_flag then
-      print('max grad = ' .. grads:max())
-      print('min grad = ' .. grads:min())
-      print('loss = ' .. loss)
-    end
     return loss, grads
   end
 

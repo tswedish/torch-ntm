@@ -1,6 +1,6 @@
 --[[
 
-  Training a NTM to memorize input.
+  Training a NTM to memorize input. -
 
   The current version seems to work, giving good output after 5000 iterations
   or so. Proper initialization of the read/write weights seems to be crucial

@@ -34,6 +34,9 @@ function NTM:__init(config)
   self.shift_range = config.shift_range or 1
   self.write_heads = config.write_heads or 1
   self.read_heads  = config.read_heads  or 1
+  self.use_lrua    = config.use_lrua    or false -- add to config in future
+  self.use_cuda    = config.use_cuda    or false
+  self.batch_size  = config.batch_size  or 1
 
   self.depth = 0
   self.cells = {}
@@ -46,47 +49,49 @@ end
 function NTM:init_grad_inputs()
   local ww_gradInput
   if self.write_heads == 1 then
-    ww_gradInput = torch.zeros(self.mem_rows)
+    ww_gradInput = torch.zeros(self.batch_size,self.mem_rows)
   else
     ww_gradInput = {}
     for i = 1, self.write_heads do
-      ww_gradInput[i] = torch.zeros(self.mem_rows)
+      ww_gradInput[i] = torch.zeros(self.batch_size,self.mem_rows)
     end
   end
 
   local wr_gradInput, r_gradInput
   if self.read_heads == 1 then
-    wr_gradInput = torch.zeros(self.mem_rows)
-    r_gradInput = torch.zeros(self.mem_cols)
+    wr_gradInput = torch.zeros(self.batch_size,self.mem_rows)
+    r_gradInput = torch.zeros(self.batch_size,self.mem_cols)
   else
     wr_gradInput, r_gradInput = {}, {}
     for i = 1, self.read_heads do
-      wr_gradInput[i] = torch.zeros(self.mem_rows) 
-      r_gradInput[i] = torch.zeros(self.mem_cols)
+      wr_gradInput[i] = torch.zeros(self.batch_size,self.mem_rows)
+      r_gradInput[i] = torch.zeros(self.batch_size,self.mem_cols)
     end
   end
 
   local m_gradInput, c_gradInput
   if self.cont_layers == 1 then
-    m_gradInput = torch.zeros(self.cont_dim)
-    c_gradInput = torch.zeros(self.cont_dim)
+    m_gradInput = torch.zeros(self.batch_size,self.cont_dim)
+    c_gradInput = torch.zeros(self.batch_size,self.cont_dim)
   else
     m_gradInput, c_gradInput = {}, {}
     for i = 1, self.cont_layers do
-      m_gradInput[i] = torch.zeros(self.cont_dim)
-      c_gradInput[i] = torch.zeros(self.cont_dim)
+      m_gradInput[i] = torch.zeros(self.batch_size,self.cont_dim)
+      c_gradInput[i] = torch.zeros(self.batch_size,self.cont_dim)
     end
   end
 
+  -- how to incorporate batches?
   self.gradInput = {
-    torch.zeros(self.input_dim), -- input
-    torch.zeros(self.mem_rows, self.mem_cols), -- M
+    torch.zeros(self.batch_size,self.input_dim), -- input
+    torch.zeros(self.batch_size,self.mem_rows, self.mem_cols), -- M
     wr_gradInput,
     ww_gradInput,
     r_gradInput,
     m_gradInput,
     c_gradInput
   }
+
 end
 
 -- The initialization module initializes the state of NTM memory,
@@ -110,9 +115,11 @@ function NTM:new_init_module()
     -- We initialize the read and write distributions such that the
     -- weights decay exponentially over the rows of NTM memory.
     -- This sort of initialization seems to be important in my experiments (kst).
-    wr_init_lin.bias:copy(torch.range(self.mem_rows, 1, -1))
+    --wr_init_lin.bias:copy(torch.range(self.mem_rows, 1, -1))
+    wr_init_lin:reset(math.sqrt(2/(wr_init_lin.weight:size(2)+wr_init_lin.weight:size(1))))
+    wr_init_lin.bias:zero()
   end
-  
+
   -- write weights
   local ww_init = {}
   for i = 1, self.write_heads do
@@ -120,9 +127,11 @@ function NTM:new_init_module()
     ww_init[i] = nn.SoftMax()(ww_init_lin(dummy))
 
     -- See initialization comment above
-    ww_init_lin.bias:copy(torch.range(self.mem_rows, 1, -1))
+    --ww_init_lin.bias:copy(torch.range(self.mem_rows, 1, -1))
+    ww_init_lin:reset(math.sqrt(2/(ww_init_lin.weight:size(2)+ww_init_lin.weight:size(1))))
+    ww_init_lin.bias:zero()
   end
-  
+
   -- controller state
   local m_init, c_init = {}, {}
   for i = 1, self.cont_layers do
@@ -140,7 +149,14 @@ function NTM:new_init_module()
   local inits = {
     output_init, M_init, wr_init, ww_init, r_init, m_init, c_init
   }
-  return nn.gModule({dummy}, inits)
+
+  if self.use_cuda then
+    local init_mod_gpu = nn.gModule({dummy}, inits):cuda()
+    cudnn.convert(init_mod_gpu,cudnn)
+    return init_mod_gpu
+  else
+    return nn.gModule({dummy}, inits)
+  end
 end
 
 -- Create a new NTM cell. Each cell shares the parameters of the "master" cell
@@ -153,6 +169,8 @@ function NTM:new_cell()
   local M_p = nn.Identity()()
   local wr_p = nn.Identity()()
   local ww_p = nn.Identity()()
+  -- we use ww_p for wu_p in the lrua case
+  --local wu_p = nn.Identity()()
 
   -- vector read from memory
   local r_p = nn.Identity()()
@@ -163,15 +181,28 @@ function NTM:new_cell()
 
   -- output and hidden states of the controller module
   local mtable, ctable = self:new_controller_module(input, r_p, mtable_p, ctable_p)
-  local m = (self.cont_layers == 1) and mtable 
+  local m = (self.cont_layers == 1) and mtable
     or nn.SelectTable(self.cont_layers)(mtable)
-  local M, wr, ww, r = self:new_mem_module(M_p, wr_p, ww_p, m)
-  local output = self:new_output_module(m)
+
+  local M, wr, ww, r
+  if self.use_lrua then
+    M, wr, ww, r = self:new_lrua_mem_module(M_p, wr_p, ww_p, m)
+  else
+    M, wr, ww, r = self:new_mem_module(M_p, wr_p, ww_p, m)
+  end
+
+  --local output = self:new_output_module(m)
+  local output = self:new_mann_output_module(r,m)
 
   local inputs = {input, M_p, wr_p, ww_p, r_p, mtable_p, ctable_p}
   local outputs = {output, M, wr, ww, r, mtable, ctable}
 
+
   local cell = nn.gModule(inputs, outputs)
+  if self.use_cuda then
+    cell:cuda()
+    cudnn.convert(cell,cudnn)
+  end
   if self.master_cell ~= nil then
     share_params(cell, self.master_cell, 'weight', 'bias', 'gradWeight', 'gradBias')
   end
@@ -198,6 +229,7 @@ function NTM:new_controller_module(input, r_p, mtable_p, ctable_p)
           nn.Linear(self.input_dim, self.cont_dim)(input),
           nn.Linear(self.cont_dim, self.cont_dim)(m_p)
         }
+        -- Remove because paper doesn't mention this!? (if simple example doesn't work)
         if self.read_heads == 1 then
           table.insert(in_modules, nn.Linear(self.mem_cols, self.cont_dim)(r_p))
         else
@@ -206,6 +238,7 @@ function NTM:new_controller_module(input, r_p, mtable_p, ctable_p)
             table.insert(in_modules, nn.Linear(self.mem_cols, self.cont_dim)(vec))
           end
         end
+
         return nn.CAddTable()(in_modules)
       end
     else
@@ -281,12 +314,130 @@ function NTM:new_mem_module(M_p, wr_p, ww_p, m)
   return M, wr, ww, r
 end
 
+function NTM:new_lrua_mem_module(M_p, wr_p, twu_p, m)
+  -- paper indicates we should write before reading...
+  -- pull out one of the last updated states
+
+  --assert(self.write_heads > self.read_heads,'number of write heads must equal number of read heads')
+
+  if self.write_heads > 1 then
+    wu_p = nn.SelectTable(1)(twu_p)
+  else
+    wu_p = twu_p
+  end
+
+  -- write heads
+  local swr_p, ww, a, wu_min, M_erase, M_write, sww
+  if self.write_heads == 1 then
+    if self.read_heads > 1 then
+      swr_p = nn.CAddTable()(wr_p)
+    else
+      swr_p = nn.Identity()(wr_p)
+    end
+    ww, a, wu_min = self:new_lrua_write_head(M_p, swr_p, wu_p, m)
+    M_erase = nn.AddConstant(1)(nn.MulConstant(-1)(nn.Replicate(self.mem_cols,2,1)(wu_min)))
+    M_write = nn.OuterProd(){ww, a}
+    sww = ww
+  else
+    ww, a, wu_min, M_erase, M_write = {}, {}, {}, {}, {}
+    for i = 1, self.write_heads do
+      local prev_weights = nn.SelectTable(i)(wr_p)
+      ww[i], a[i], wu_min[i] = self:new_lrua_write_head(M_p, prev_weights, wu_p, m)
+      M_erase[i] = nn.AddConstant(1)(nn.MulConstant(-1)(nn.Replicate(self.mem_cols,2,1)(wu_min[i])))
+      M_write[i] = nn.OuterProd(){ww[i], a[i]}
+    end
+    M_erase = nn.CMulTable()(M_erase)
+    M_write = nn.CAddTable()(M_write)
+    --ww = nn.Identity()(ww_t)
+    sww = nn.CAddTable()(ww)
+  end
+  -- erase some history from memory
+  local Mtilde = nn.CMulTable(){M_p, M_erase}
+  -- write to memory
+  local M = nn.CAddTable(){Mtilde, M_write}
+
+  -- read heads
+  local wr, r, swr
+  if self.read_heads == 1 then
+    wr, r = self:new_lrua_read_head(M, m)
+    swr = wr
+  else
+    wr, r = {}, {}
+    for i = 1, self.read_heads do
+      wr[i], r[i] = self:new_lrua_read_head(M, m)
+    end
+    swr = nn.CAddTable()(wr)
+    wr = nn.Identity()(wr)
+    r = nn.Identity()(r)
+  end
+
+  -- update wu
+  local gamma = 0.95
+  local wu = nn.CAddTable() {
+    nn.MulConstant(gamma)(wu_p),
+    swr,
+    sww
+  }
+
+  -- we want to make wu have the right size back to gradinput (num write heads)
+  local rwu
+  if self.write_heads > 1 then
+    rwu = {}
+    for i = 1,self.write_heads do
+      rwu[i] = nn.Identity()(wu)
+    end
+    rwu = nn.Identity()(rwu)
+  else
+    rwu = wu
+  end
+
+  return M, wr, rwu, r
+end
+
 function NTM:new_read_head(M_p, w_p, m)
   return self:new_head(M_p, w_p, m, true)
 end
 
 function NTM:new_write_head(M_p, w_p, m)
   return self:new_head(M_p, w_p, m, false)
+end
+
+function NTM:new_lrua_read_head(M_p, m)
+  return self:new_lrua_head(M_p, nil, nil, m, true)
+end
+
+function NTM:new_lrua_write_head(M_p, wr_p, wu_p, m)
+  return self:new_lrua_head(M_p, wr_p, wu_p, m, false)
+end
+
+-- work in progress from MANN paper
+function NTM:new_lrua_head(M_p,wr_p,wu_p,m,is_read)
+  -- key vector
+  local k = nn.Tanh()(nn.Linear(self.cont_dim, self.mem_cols)(m))
+
+  if is_read then
+    local wr = nn.SoftMax()(nn.SmoothCosineSimilarity(){M_p, k})
+    local r = nn.MixtureTable(){wr, M_p}
+    return wr, r
+  end
+
+  --local n = self.read_heads
+  -- calculate the lowest n
+  local wlu_p = nn.MinNMask(self.read_heads)(wu_p)
+  -- smallest element mask
+  local wu_first_p = nn.MinNMask(1)(wu_p)
+
+  -- gating parameter
+  local sigma = nn.Sigmoid()(nn.Linear(self.cont_dim, 1)(m))
+
+  --local wc = nn.SoftMax()(nn.ScalarMulTable(){sim, beta})
+  local ww = nn.CAddTable(){
+    nn.ScalarMulTable(){wr_p, sigma},
+    nn.ScalarMulTable(){wlu_p, nn.AddConstant(1)(nn.MulConstant(-1)(sigma))}
+  }
+
+  return ww, k, wu_first_p
+
 end
 
 -- Create a new head
@@ -302,7 +453,7 @@ function NTM:new_head(M_p, w_p, m, is_read)
   -- exponential focusing parameter
   local gamma = nn.AddConstant(1)(
     nn.SoftPlus()(nn.Linear(self.cont_dim, 1)(m)))
-  
+
   local sim = nn.SmoothCosineSimilarity(){M_p, k}
   local wc = nn.SoftMax()(nn.ScalarMulTable(){sim, beta})
   local wg = nn.CAddTable(){
@@ -313,7 +464,7 @@ function NTM:new_head(M_p, w_p, m, is_read)
   local wtilde = nn.CircularConvolution(){wg, s}
   local wpow = nn.PowTable(){wtilde, gamma}
   local w = nn.Normalize(1)(wpow)
-  
+
   if is_read then
     local r = nn.MixtureTable(){w, M_p}
     return w, r
@@ -330,7 +481,45 @@ function NTM:new_output_module(m)
   return output
 end
 
--- Forward propagate one time step. The outputs of previous time steps are 
+-- Create an output module, e.g. to output binary strings.
+-- changed to logsoftmax
+function NTM:new_mann_output_module(r,m)
+  local r_flat
+  if self.read_heads > 1 then
+    r_flat = nn.JoinTable(1,1)(r)
+  else
+    r_flat = nn.Identity()(r)
+  end
+
+  local preactivation = nn.JoinTable(1,1){r_flat,m}
+
+  local output = nn.LogSoftMax()(nn.Linear(
+    self.cont_dim+self.read_heads*self.mem_cols,
+    self.output_dim)(preactivation)
+  )
+  return output
+end
+
+function NTM:initInputState(state)
+  for i = 1, #state do
+    if type(state[i]) == 'table' then
+      for j = 1,#state[i] do
+        state[i][j]:zero()
+      end
+    else
+      state[i]:zero()
+    end
+  end
+  -- small value for memory to init
+  state[2]:fill(1e-6)
+  -- ww/wu wr set with first entry 1 for all batches
+  for i = 1,#state[3] do
+    state[3][i][{{},1}]:fill(1)
+    state[4][i][{{},1}]:fill(1)
+  end
+end
+
+-- Forward propagate one time step. The outputs of previous time steps are
 -- cached for backpropagation.
 function NTM:forward(input)
   self.depth = self.depth + 1
@@ -339,16 +528,25 @@ function NTM:forward(input)
     cell = self:new_cell()
     self.cells[self.depth] = cell
   end
-  
+
   local prev_outputs
   if self.depth == 1 then
-    prev_outputs = self.init_module:forward(torch.Tensor{0})
+    if self.use_cuda then
+      prev_outputs = self.init_module:forward(torch.CudaTensor(self.batch_size,1))
+    else
+      prev_outputs = self.init_module:forward(torch.Tensor(self.batch_size,1))
+    end
+    -- if depth is 1 make sure and clear NTM
+    -- clear everything
+    self:initInputState(prev_outputs)
   else
     prev_outputs = self.cells[self.depth - 1].output
   end
 
   -- get inputs
+
   local inputs = {input}
+
   for i = 2, #prev_outputs do
     inputs[i] = prev_outputs[i]
   end
@@ -372,7 +570,16 @@ function NTM:backward(input, grad_output)
   -- get inputs
   local prev_outputs
   if self.depth == 1 then
-    prev_outputs = self.init_module:forward(torch.Tensor{0})
+    if self.use_cuda then
+      prev_outputs = self.init_module:forward(torch.CudaTensor(self.batch_size,1))
+    else
+      prev_outputs = self.init_module:forward(torch.Tensor(self.batch_size,1))
+    end
+
+    -- if depth is 1 make sure and clear NTM
+    -- clear everything hack
+    self:initInputState(prev_outputs)
+
   else
     prev_outputs = self.cells[self.depth - 1].output
   end
@@ -384,7 +591,11 @@ function NTM:backward(input, grad_output)
   self.gradInput = cell:backward(inputs, grad_outputs)
   self.depth = self.depth - 1
   if self.depth == 0 then
-    self.init_module:backward(torch.Tensor{0}, self.gradInput)
+    if self.use_cuda then
+      self.init_module:backward(torch.CudaTensor(self.batch_size,1), self.gradInput)
+    else
+      self.init_module:backward(torch.Tensor(self.batch_size,1), self.gradInput)
+    end
     for i = 1, #self.gradInput do
       local gradInput = self.gradInput[i]
       if type(gradInput) == 'table' then
@@ -403,7 +614,7 @@ function NTM:get_memory(depth)
     return self.initial_values[2]
   end
   local depth = depth or self.depth
-  return self.cells[self.depth].output[2]
+  return self.cells[depth].output[2]
 end
 
 -- Get read head weights over the rows of memory
@@ -443,9 +654,18 @@ end
 
 function NTM:forget()
   self.depth = 0
+  -- actually obliterate (may not need...too costly?)
+  -- aself.cells = {}
   self:zeroGradParameters()
+
   for i = 1, #self.gradInput do
-    self.gradInput[i]:zero()
+    if type(self.gradInput[i]) == 'table' then
+      for j = 1,#self.gradInput[i] do
+        self.gradInput[i][j]:zero()
+      end
+    else
+      self.gradInput[i]:zero()
+    end
   end
 end
 
