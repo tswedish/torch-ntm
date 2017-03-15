@@ -1,6 +1,15 @@
 A Neural Turing Machine in Torch
 ================================
 
+This is a fork of torch-ntm from kaishengtai/torch-ntm. It adds a batch mode, LRUA module layers, and some explicit CUDA support.
+
+NOTE: Usage below has not yet been updated, instead try:
+
+```
+th tasks/one_shot.lua
+```
+This new example is a toy task that follows the Learning to Learn approach followed in this [paper](https://arxiv.org/abs/1605.06065) by Santoro et al.
+
 A Torch implementation of the Neural Turing Machine model described in this 
 [paper](http://arxiv.org/abs/1410.5401) by Alex Graves, Greg Wayne and Ivo Danihelka.
 
