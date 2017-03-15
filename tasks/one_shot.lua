@@ -1,5 +1,7 @@
-require 'torch-ntm/'
-require 'xlua'
+require('../')
+require('./util')
+require('optim')
+--require 'xlua'
 
 -- load NTM model and criterion w/ config
 local config = {
@@ -181,8 +183,8 @@ for i=1,iters do
   local latest_loss = all_loss[#all_loss]
   if loss_m_avg == 0 then loss_m_avg = latest_loss end
   loss_m_avg = alpha*latest_loss + (1-alpha)*loss_m_avg
-  --print(loss_m_avg)
+  print(loss_m_avg)
 
-  xlua.progress(i,iters)
+  --xlua.progress(i,iters)
 
 end
